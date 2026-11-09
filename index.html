@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Голосование за песни группы</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        rock: {
+                            900: '#0f1015',
+                            800: '#181a24',
+                            700: '#222534',
+                            600: '#2d3246',
+                            accent: '#f97316', // Vibrant orange accent
+                            accentHover: '#ea580c'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;850&display=swap" rel="stylesheet">
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Expose Firebase tools globally for our vanilla JS app
+        window.FB = {
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, getDoc, setDoc
+        };
+    </script>
+    
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for cool rock look */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #181a24;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #2d3246;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #f97316;
+        }
+    </style>
+    <!-- JavaScript Application Logic -->
+    <script>
+        // State Management
+        let songs = [];
+        let sortMode = 'rating'; // 'rating' or 'date'
+        let votedSongs = new Set(); // Track songs voted by local user
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let unsubscribeSongs = null;
+
+        // Initialize on DOM load
+        window.addEventListener('DOMContentLoaded', async () => {
+            const statusEl = document.getElementById('cloudStatus');
+            
+            try {
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'bandset-default-app';
+                const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+
+                if (!firebaseConfig) {
+                    throw new Error("No Firebase config available");
+                }
+
+                const app = window.FB.initializeApp(firebaseConfig);
+                db = window.FB.getFirestore(app);
+                auth = window.FB.getAuth(app);
+
+                // Authenticate
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await window.FB.signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await window.FB.signInAnonymously(auth);
+                }
+
+                userId = auth.currentUser?.uid || crypto.randomUUID();
+                
+                if (statusEl) {
+                    statusEl.innerHTML = '<i class="fa-solid fa-cloud text-emerald-400"></i><span class="text-emerald-400">Облако подключено</span>';
+                }
+
+                // Load user votes from localStorage or initialize
+                const savedVoted = localStorage.getItem('bandset_voted_' + appId);
+                if (savedVoted) {
+                    votedSongs = new Set(JSON.parse(savedVoted));
+                }
+
+                // Start real-time listener
+                initFirestoreSync(appId);
+
+            } catch (e) {
+                console.warn("Cloud init fallback to local:", e);
+                if (statusEl) {
+                    statusEl.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-amber-400"></i><span class="text-amber-400">Локальный режим</span>';
+                }
+                loadLocalFallback();
+            }
+        });
+
+        function initFirestoreSync(appId) {
+            const songsRef = window.FB.collection(db, 'artifacts', appId, 'public', 'data', 'songs');
+            
+            unsubscribeSongs = window.FB.onSnapshot(songsRef, (snapshot) => {
+                const loadedSongs = [];
+                snapshot.forEach((docSnap) => {
+                    loadedSongs.push({ id: docSnap.id, ...docSnap.data() });
+                });
+
+                if (loadedSongs.length === 0) {
+                    // Seed initial data if empty
+                    const defaultSongs = [
+                        {
+                            title: 'Туман',
+                            artist: 'Сектор Газа',
+                            link: 'https://amdm.ru/akkordi/sektor_gaza/9779/tuman/',
+                            votes: 3,
+                            createdAt: Date.now() - 3600000 * 24
+                        },
+                        {
+                            title: 'Группа крови',
+                            artist: 'Кино',
+                            link: 'https://amdm.ru/akkordi/kino/13014/grup_krovi/',
+                            votes: 5,
+                            createdAt: Date.now() - 3600000 * 48
+                        }
+                    ];
+                    defaultSongs.forEach(s => window.FB.addDoc(songsRef, s));
+                } else {
+                    songs = loadedSongs;
+                    renderSongs();
+                }
+            }, (error) => {
+                console.error("Firestore sync error:", error);
+                loadLocalFallback();
+            });
+        }
+
+        function loadLocalFallback() {
+            try {
+                const savedSongs = localStorage.getItem('bandset_songs_v10');
+                const savedVoted = localStorage.getItem('bandset_voted_v10');
+                if (savedVoted) votedSongs = new Set(JSON.parse(savedVoted));
+                if (savedSongs) {
+                    songs = JSON.parse(savedSongs);
+                } else {
+                    songs = [
+                        { id: '1', title: 'Туман', artist: 'Сектор Газа', link: '', votes: 2, createdAt: Date.now() }
+                    ];
+                }
+                renderSongs();
+            } catch (e) {
+                renderSongs();
+            }
+        }
+
+        function saveLocalFallback() {
+            try {
+                localStorage.setItem('bandset_songs_v10', JSON.stringify(songs));
+                localStorage.setItem('bandset_voted_v10', JSON.stringify(Array.from(votedSongs)));
+            } catch (e) {}
+        }
+
+        // Modal Controls
+        function openModal() {
+            const modal = document.getElementById('songModal');
+            const content = document.getElementById('modalContent');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            setTimeout(() => {
+                content.classList.remove('scale-95', 'opacity-0');
+                content.classList.add('scale-100', 'opacity-100');
+            }, 10);
+            document.getElementById('songTitle').focus();
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('songModal');
+            const content = document.getElementById('modalContent');
+            content.classList.remove('scale-100', 'opacity-100');
+            content.classList.add('scale-95', 'opacity-0');
+            setTimeout(() => {
+                modal.classList.remove('flex');
+                modal.classList.add('hidden');
+                document.getElementById('addSongForm').reset();
+            }, 200);
+        }
+
+        function showNotification(title, message) {
+            document.getElementById('notifTitle').innerText = title;
+            document.getElementById('notifMessage').innerText = message;
+            const modal = document.getElementById('notificationModal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeNotification() {
+            const modal = document.getElementById('notificationModal');
+            modal.classList.remove('flex');
+            modal.classList.add('hidden');
+        }
+
+        // Form Submission
+        async function handleFormSubmit(e) {
+            e.preventDefault();
+            const titleInput = document.getElementById('songTitle');
+            const artistInput = document.getElementById('songArtist');
+            const linkInput = document.getElementById('songLink');
+
+            const newSong = {
+                title: titleInput.value.trim(),
+                artist: artistInput.value.trim(),
+                link: linkInput.value.trim(),
+                votes: 0,
+                createdAt: Date.now()
+            };
+
+            if (db && auth && auth.currentUser) {
+                try {
+                    const appId = typeof __app_id !== 'undefined' ? __app_id : 'bandset-default-app';
+                    const songsRef = window.FB.collection(db, 'artifacts', appId, 'public', 'data', 'songs');
+                    await window.FB.addDoc(songsRef, newSong);
+                } catch (err) {
+                    console.error("Error adding to cloud:", err);
+                    songs.push({ id: 'local_' + Date.now(), ...newSong });
+                    saveLocalFallback();
+                    renderSongs();
+                }
+            } else {
+                songs.push({ id: 'local_' + Date.now(), ...newSong });
+                saveLocalFallback();
+                renderSongs();
+            }
+
+            closeModal();
+            showNotification('Успешно!', 'Песня добавлена в общий список.');
+        }
+
+        // Voting mechanism
+        async function toggleVote(songId) {
+            const song = songs.find(s => s.id === songId);
+            if (!song) return;
+
+            let newVotes = song.votes;
+            if (votedSongs.has(songId)) {
+                newVotes = Math.max(0, song.votes - 1);
+                votedSongs.delete(songId);
+            } else {
+                newVotes = song.votes + 1;
+                votedSongs.add(songId);
+            }
+
+            // Save user votes state locally
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'bandset-default-app';
+            localStorage.setItem('bandset_voted_' + appId, JSON.stringify(Array.from(votedSongs)));
+
+            if (db && auth && auth.currentUser && !songId.startsWith('local_')) {
+                try {
+                    const docRef = window.FB.doc(db, 'artifacts', appId, 'public', 'data', 'songs', songId);
+                    await window.FB.updateDoc(docRef, { votes: newVotes });
+                } catch (err) {
+                    console.error("Error updating vote in cloud:", err);
+                    song.votes = newVotes;
+                    saveLocalFallback();
+                    renderSongs();
+                }
+            } else {
+                song.votes = newVotes;
+                saveLocalFallback();
+                renderSongs();
+            }
+        }
+
+        // Delete song
+        async function deleteSong(songId) {
+            votedSongs.delete(songId);
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'bandset-default-app';
+            localStorage.setItem('bandset_voted_' + appId, JSON.stringify(Array.from(votedSongs)));
+
+            if (db && auth && auth.currentUser && !songId.startsWith('local_')) {
+                try {
+                    const docRef = window.FB.doc(db, 'artifacts', appId, 'public', 'data', 'songs', songId);
+                    await window.FB.deleteDoc(docRef);
+                } catch (err) {
+                    console.error("Error deleting from cloud:", err);
+                }
+            }
+            
+            songs = songs.filter(s => s.id !== songId);
+            saveLocalFallback();
+            renderSongs();
+            showNotification('Удалено', 'Песня была удалена из списка.');
+        }
+
+        // Sorting Switch
+        function setSortMode(mode) {
+            sortMode = mode;
+            const ratingBtn = document.getElementById('sortRatingBtn');
+            const dateBtn = document.getElementById('sortDateBtn');
+
+            if (mode === 'rating') {
+                ratingBtn.className = "px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-accent text-white shadow-md";
+                dateBtn.className = "px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-700 text-gray-300 hover:bg-rock-600";
+            } else {
+                dateBtn.className = "px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-accent text-white shadow-md";
+                ratingBtn.className = "px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-700 text-gray-300 hover:bg-rock-600";
+            }
+
+            renderSongs();
+        }
+
+        // Render Loop
+        function renderSongs() {
+            const listEl = document.getElementById('songsList');
+            const emptyEl = document.getElementById('emptyState');
+            const totalSongsEl = document.getElementById('totalSongsCount');
+            const totalVotesEl = document.getElementById('totalVotesCount');
+
+            if (!listEl) return;
+
+            // Update stats
+            totalSongsEl.innerText = songs.length;
+            const totalVotes = songs.reduce((acc, curr) => acc + (curr.votes || 0), 0);
+            totalVotesEl.innerText = totalVotes;
+
+            if (songs.length === 0) {
+                listEl.innerHTML = '';
+                emptyEl.classList.remove('hidden');
+                emptyEl.classList.add('flex');
+                return;
+            }
+
+            emptyEl.classList.remove('flex');
+            emptyEl.classList.add('hidden');
+
+            // Sort songs
+            let sorted = [...songs];
+            if (sortMode === 'rating') {
+                sorted.sort((a, b) => {
+                    if ((b.votes || 0) !== (a.votes || 0)) {
+                        return (b.votes || 0) - (a.votes || 0);
+                    }
+                    return (b.createdAt || 0) - (a.createdAt || 0);
+                });
+            } else {
+                sorted.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            }
+
+            listEl.innerHTML = '';
+
+            sorted.forEach((song, index) => {
+                const hasVoted = votedSongs.has(song.id);
+                const rank = index + 1;
+                
+                let rankBadgeBg = 'bg-rock-700/60 text-gray-300 border border-rock-600';
+                if (sortMode === 'rating') {
+                    if (rank === 1) rankBadgeBg = 'bg-amber-500/20 text-amber-400 border border-amber-500/40 shadow-lg shadow-amber-500/10 font-bold';
+                    else if (rank === 2) rankBadgeBg = 'bg-slate-300/20 text-slate-300 border border-slate-300/40 font-bold';
+                    else if (rank === 3) rankBadgeBg = 'bg-amber-700/20 text-amber-600 border border-amber-700/40 font-bold';
+                }
+
+                const card = document.createElement('div');
+                card.className = `bg-rock-800 border ${hasVoted ? 'border-rock-accent/50 shadow-md shadow-rock-accent/5' : 'border-rock-700/70'} rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 transition hover:border-rock-600`;
+
+                card.innerHTML = `
+                    <div class="flex items-center gap-4 w-full sm:w-auto">
+                        <div class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${rankBadgeBg}">
+                            ${sortMode === 'rating' ? (rank <= 3 ? '<i class="fa-solid fa-trophy mr-1 text-xs"></i>' : '') + rank : '#' + rank}
+                        </div>
+                        <div class="min-w-0 flex-grow">
+                            <h3 class="text-base font-bold text-white truncate flex items-center gap-2">
+                                ${escapeHtml(song.title)}
+                            </h3>
+                            <p class="text-xs text-gray-400 truncate mt-0.5">
+                                <i class="fa-solid fa-microphone-lines mr-1 text-rock-accent"></i> ${escapeHtml(song.artist)}
+                            </p>
+                            ${song.link ? `
+                                <a href="${escapeHtml(song.link)}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 text-xs text-rock-accent hover:text-amber-400 mt-2 transition bg-rock-900/60 px-2.5 py-1 rounded-lg border border-rock-700/50">
+                                    <i class="fa-solid fa-link"></i> Табы / Аккорды / Разбор
+                                </a>
+                            ` : ''}
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between sm:justify-end gap-3 w-full sm:w-auto border-t sm:border-t-0 pt-3 sm:pt-0 border-rock-700/50">
+                        <button onclick="toggleVote('${song.id}')" class="flex-grow sm:flex-grow-0 px-4 py-2.5 rounded-xl font-medium text-xs sm:text-sm transition flex items-center justify-center gap-2 ${
+                            hasVoted 
+                            ? 'bg-rock-accent text-white shadow-lg shadow-rock-accent/20' 
+                            : 'bg-rock-700/60 hover:bg-rock-700 text-gray-200 border border-rock-600/50'
+                        }">
+                            <i class="fa-solid fa-heart ${hasVoted ? 'text-white' : 'text-rock-accent'}"></i>
+                            <span>${hasVoted ? 'Ваш голос' : 'Голосовать'}</span>
+                            <span class="ml-1 px-2 py-0.5 rounded-lg bg-black/20 text-white font-bold">${song.votes || 0}</span>
+                        </button>
+
+                        <button onclick="deleteSong('${song.id}')" title="Удалить песню" class="w-10 h-10 rounded-xl bg-rock-700/30 hover:bg-red-500/20 text-gray-400 hover:text-red-400 border border-rock-700/60 hover:border-red-500/30 flex items-center justify-center transition">
+                            <i class="fa-solid fa-trash-can text-xs"></i>
+                        </button>
+                    </div>
+                `;
+                listEl.appendChild(card);
+            });
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+    </script>
+</head>
+<body class="bg-rock-900 text-gray-100 min-h-screen flex flex-col selection:bg-rock-accent selection:text-white">
+
+    <!-- Header -->
+    <header class="bg-rock-800/80 backdrop-blur border-b border-rock-700 sticky top-0 z-50">
+        <div class="max-w-4xl mx-auto px-4 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-rock-accent to-amber-600 flex items-center justify-center shadow-lg shadow-rock-accent/20">
+                    <i class="fa-solid fa-guitar text-white text-lg"></i>
+                </div>
+                <div>
+                    <h1 class="text-xl font-extrabold tracking-wide uppercase text-white flex items-center gap-2">
+                        BandSet <span class="text-xs px-2 py-0.5 rounded-full bg-rock-accent/20 text-rock-accent border border-rock-accent/30 font-semibold">Голосование</span>
+                    </h1>
+                    <div class="flex items-center gap-2 mt-0.5">
+                        <p class="text-xs text-gray-400">Выбираем треки для репетиций</p>
+                        <span id="cloudStatus" class="text-xs flex items-center gap-1 text-gray-500 font-medium">
+                            <i class="fa-solid fa-spinner animate-spin"></i> Подключение...
+                        </span>
+                    </div>
+                </div>
+            </div>
+            <button onclick="openModal()" class="w-full sm:w-auto bg-rock-accent hover:bg-rock-accentHover text-white px-5 py-2.5 rounded-xl font-medium text-sm transition shadow-lg shadow-rock-accent/20 flex items-center justify-center gap-2">
+                <i class="fa-solid fa-plus"></i> Добавить песню
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="flex-grow max-w-4xl w-full mx-auto px-4 py-6 flex flex-col gap-6">
+
+        <!-- Controls / Sorting & Stats Bar -->
+        <div class="bg-rock-800 rounded-2xl p-4 border border-rock-700/60 shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div class="flex items-center gap-3 w-full sm:w-auto">
+                <span class="text-sm text-gray-400 font-medium whitespace-nowrap"><i class="fa-solid fa-sort mr-1.5 text-rock-accent"></i>Сортировка:</span>
+                <div class="grid grid-cols-2 gap-2 w-full sm:w-auto">
+                    <button id="sortRatingBtn" onclick="setSortMode('rating')" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-accent text-white shadow-md">
+                        По рейтингу
+                    </button>
+                    <button id="sortDateBtn" onclick="setSortMode('date')" class="px-4 py-2 rounded-xl text-sm font-medium transition bg-rock-700 text-gray-300 hover:bg-rock-600">
+                        Свежие
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-4 text-xs text-gray-400 w-full sm:w-auto justify-end border-t sm:border-t-0 pt-3 sm:pt-0 border-rock-700/60">
+                <div class="flex items-center gap-1.5">
+                    <i class="fa-solid fa-music text-rock-accent"></i>
+                    <span>Всего песен: <strong id="totalSongsCount" class="text-white">0</strong></span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <i class="fa-solid fa-fire text-amber-500"></i>
+                    <span>Голосов: <strong id="totalVotesCount" class="text-white">0</strong></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Song List -->
+        <div id="songsList" class="flex flex-col gap-3">
+            <!-- Dynamically populated song cards will appear here -->
+        </div>
+
+        <!-- Empty State -->
+        <div id="emptyState" class="hidden flex-col items-center justify-center py-16 px-4 text-center bg-rock-800/40 border border-dashed border-rock-700 rounded-3xl">
+            <div class="w-16 h-16 rounded-2xl bg-rock-800 flex items-center justify-center text-rock-accent text-2xl mb-4 shadow-inner">
+                <i class="fa-solid fa-record-vinyl"></i>
+            </div>
+            <h3 class="text-lg font-bold text-white mb-1">Список пока пуст</h3>
+            <p class="text-gray-400 text-sm max-w-sm mb-6">Добавьте первую песню, которую ваша группа хочет разобрать, чтобы начать голосование.</p>
+            <button onclick="openModal()" class="bg-rock-accent hover:bg-rock-accentHover text-white px-5 py-2.5 rounded-xl font-medium text-sm transition shadow-lg shadow-rock-accent/20">
+                Добавить трек
+            </button>
+        </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="border-t border-rock-800 py-6 text-center text-xs text-gray-500">
+        <p>BandSet Song Voting • Общие репетиции и джемы</p>
+    </footer>
+
+    <!-- Add Song Modal -->
+    <div id="songModal" class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm hidden items-center justify-center p-4">
+        <div class="bg-rock-800 border border-rock-700 rounded-3xl max-w-md w-full p-6 shadow-2xl transform transition-all scale-95 opacity-0 duration-200" id="modalContent">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                    <i class="fa-solid fa-circle-plus text-rock-accent"></i> Новая песня
+                </h3>
+                <button onclick="closeModal()" class="w-8 h-8 rounded-full bg-rock-700/60 hover:bg-rock-700 text-gray-400 hover:text-white flex items-center justify-center transition">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+
+            <form id="addSongForm" onsubmit="handleFormSubmit(event)" class="flex flex-col gap-4">
+                <div>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-1.5">Название песни *</label>
+                    <input type="text" id="songTitle" required placeholder="Например: Enter Sandman" class="w-full bg-rock-900 border border-rock-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-rock-accent transition placeholder:text-gray-600">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-1.5">Исполнитель / Группа *</label>
+                    <input type="text" id="songArtist" required placeholder="Например: Metallica" class="w-full bg-rock-900 border border-rock-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-rock-accent transition placeholder:text-gray-600">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-1.5">Ссылка на табы, аккорды или видео</label>
+                    <input type="url" id="songLink" placeholder="https://tabs.ultimate-guitar.com/..." class="w-full bg-rock-900 border border-rock-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-rock-accent transition placeholder:text-gray-600">
+                </div>
+
+                <div class="flex items-center justify-end gap-3 mt-4">
+                    <button type="button" onclick="closeModal()" class="px-4 py-2.5 rounded-xl text-sm font-medium bg-rock-700/50 hover:bg-rock-700 text-gray-300 transition">
+                        Отмена
+                    </button>
+                    <button type="submit" class="bg-rock-accent hover:bg-rock-accentHover text-white px-5 py-2.5 rounded-xl font-medium text-sm transition shadow-lg shadow-rock-accent/20">
+                        Добавить в список
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Custom Notification Modal -->
+    <div id="notificationModal" class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm hidden items-center justify-center p-4">
+        <div class="bg-rock-800 border border-rock-700 rounded-2xl max-w-sm w-full p-5 shadow-2xl text-center">
+            <div id="notifIcon" class="w-12 h-12 rounded-xl bg-rock-accent/20 text-rock-accent text-xl flex items-center justify-center mx-auto mb-3">
+                <i class="fa-solid fa-info"></i>
+            </div>
+            <h4 id="notifTitle" class="text-base font-bold text-white mb-1">Уведомление</h4>
+            <p id="notifMessage" class="text-xs text-gray-300 mb-5">Сообщение...</p>
+            <button onclick="closeNotification()" class="w-full bg-rock-accent hover:bg-rock-accentHover text-white py-2 rounded-xl text-sm font-medium transition">
+                Понятно
+            </button>
+        </div>
+    </div>
+</body>
+</html>
